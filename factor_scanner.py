@@ -169,8 +169,73 @@ class DataManager:
             }, index=dates)
 
     def fetch_macro_data(self) -> pd.DataFrame:
-        """Fetch macro data for regime detection"""
-        # For demo, using synthetic data - replace with FRED API
+        """Fetch macro data for regime detection using FRED API"""
+        try:
+            from fredapi import Fred
+            fred = Fred(api_key='9ce40465a0fe9920f496cd179b9b9a71')
+
+            print("Fetching real macro data from FRED...")
+
+            # Fetch real economic indicators
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=365 * 10)  # 10 years of data
+
+            # Yield curve (10Y - 3M Treasury spread)
+            yield_10y = fred.get_series('DGS10', start_date, end_date)
+            yield_3m = fred.get_series('DGS3MO', start_date, end_date)
+            yield_curve = (yield_10y - yield_3m).dropna()
+
+            # Credit spread (BAA - 10Y)
+            baa = fred.get_series('BAMLC0A4CBBB', start_date, end_date)  # BBB corporate
+            credit_spread = baa.dropna()
+
+            # VIX
+            vix = fred.get_series('VIXCLS', start_date, end_date)
+
+            # PMI (ISM Manufacturing)
+            pmi = fred.get_series('MANEMP', start_date, end_date)
+
+            # Inflation (CPI YoY)
+            cpi = fred.get_series('CPIAUCSL', start_date, end_date)
+            inflation_yoy = cpi.pct_change(12) * 100  # Year-over-year percentage
+
+            # Combine all series (resample to monthly and forward-fill)
+            macro = pd.DataFrame({
+                'yield_curve': yield_curve,
+                'credit_spread': credit_spread,
+                'vix': vix,
+                'pmi': pmi,
+                'inflation_yoy': inflation_yoy
+            })
+
+            # Resample to month-end and forward-fill missing values
+            macro = macro.resample('M').last().ffill()
+
+            # Add derived features
+            macro['yield_curve_inverted'] = (macro['yield_curve'] < 0).astype(int)
+            macro['pmi_expanding'] = (macro['pmi'] > 50).astype(int)
+            macro['inflation_delta'] = macro['inflation_yoy'].diff()
+
+            # Drop any remaining NaNs
+            macro = macro.dropna()
+
+            print(
+                f"✅ Fetched real FRED data: {len(macro)} months from {macro.index[0].date()} to {macro.index[-1].date()}")
+
+            return macro
+
+        except ImportError:
+            print("⚠️ Warning: fredapi not installed. Install with: pip install fredapi")
+            print("⚠️ Falling back to synthetic data...")
+            return self._generate_synthetic_macro()
+
+        except Exception as e:
+            print(f"⚠️ Warning: Could not fetch FRED data: {e}")
+            print("⚠️ Falling back to synthetic data...")
+            return self._generate_synthetic_macro()
+
+    def _generate_synthetic_macro(self) -> pd.DataFrame:
+        """Fallback: Generate synthetic macro data"""
         dates = pd.date_range(end=datetime.now(), periods=120, freq='M')
 
         macro = pd.DataFrame({
