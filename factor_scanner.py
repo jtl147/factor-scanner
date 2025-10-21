@@ -67,9 +67,8 @@ class SystemConfig:
 
 
 # ========================= DATA MODULE =========================
-
 class DataManager:
-    """Handles all data fetching and caching"""
+    """Handles all data fetching and caching - SIMPLIFIED VERSION"""
 
     def __init__(self, cache_dir: str = "cache"):
         self.cache_dir = cache_dir
@@ -84,36 +83,180 @@ class DataManager:
             'SIZE': 'Size', 'USMV': 'Low Vol'
         }
 
-    @lru_cache(maxsize=1)
-    def get_sp500_tickers(self) -> List[str]:
-        """Get S&P 500 tickers"""
+    def get_filtered_universe(self) -> List[str]:
+        """
+        Simply read the stock list from CSV file - NO MORE WEB SCRAPING!
+        """
+        print(f"\n{'=' * 60}")
+        print(f"LOADING STOCK UNIVERSE FROM CSV")
+        print(f"{'=' * 60}")
+
         try:
-            url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-            table = pd.read_html(url)[0]
-            return table['Symbol'].tolist()
-        except:
-            # Fallback to a smaller list if Wikipedia fails
-            return ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'BRK.B',
-                    'UNH', 'JNJ', 'JPM', 'V', 'PG', 'XOM', 'HD', 'CVX', 'MA', 'ABBV',
-                    'PFE', 'COST', 'AVGO', 'KO', 'MRK', 'PEP', 'TMO', 'WMT', 'BAC',
-                    'CSCO', 'ABT', 'ACN', 'DHR', 'MCD', 'ADBE', 'CRM', 'VZ', 'NFLX',
-                    'NKE', 'CMCSA', 'LIN', 'TXN', 'NEE', 'DIS', 'PM', 'RTX', 'UPS',
-                    'T', 'INTC', 'LOW', 'HON', 'ORCL', 'QCOM'][:50]
+            # Read the CSV file
+            stocks_df = pd.read_csv('Stocks.csv')
+
+            # Get the ticker symbols (assuming column is named 'Symbol')
+            if 'Symbol' in stocks_df.columns:
+                tickers = stocks_df['Symbol'].tolist()
+            elif 'Ticker' in stocks_df.columns:
+                tickers = stocks_df['Ticker'].tolist()
+            elif 'symbol' in stocks_df.columns:
+                tickers = stocks_df['symbol'].tolist()
+            elif 'ticker' in stocks_df.columns:
+                tickers = stocks_df['ticker'].tolist()
+            else:
+                # If no named column, assume first column
+                tickers = stocks_df.iloc[:, 0].tolist()
+
+            # Clean up tickers (remove any NaN or empty strings)
+            tickers = [str(t).strip() for t in tickers if pd.notna(t) and str(t).strip()]
+
+            print(f"✅ Loaded {len(tickers)} tickers from Stocks.csv")
+
+            # Optional: limit to first N for performance during testing
+            # Uncomment this line to test with fewer stocks
+            # tickers = tickers[:100]  # For testing with 100 stocks
+
+            print(f"✅ Final universe: {len(tickers)} stocks")
+            print(f"{'=' * 60}\n")
+
+            if len(tickers) == 0:
+                raise RuntimeError("No tickers found in CSV file!")
+
+            return tickers
+
+        except FileNotFoundError:
+            print(f"❌ ERROR: Stocks.csv not found in current directory!")
+            print(f"Make sure Stocks.csv is in the same folder as factor_scanner.py")
+            raise RuntimeError("Stocks.csv file not found")
+        except Exception as e:
+            print(f"❌ ERROR reading CSV: {e}")
+            raise RuntimeError(f"Failed to read stock list from CSV: {e}")
 
     def fetch_prices(self, tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
-        """Fetch daily prices for multiple tickers"""
+        """Fetch daily prices for multiple tickers - FIXED VERSION"""
+        print(f"\nFetching prices for {len(tickers)} tickers from {start_date} to {end_date}...")
+
         prices = {}
-        for ticker in tickers:
+        failed = []
+
+        # Process in smaller batches and handle individually if batch fails
+        batch_size = 20  # Smaller batches are more reliable
+
+        for i in range(0, len(tickers), batch_size):
+            batch = tickers[i:i + batch_size]
+
+            # Try batch download first
             try:
-                data = yf.download(ticker, start=start_date, end=end_date, progress=False)
-                if not data.empty and len(data) > 0:
-                    prices[ticker] = data['Adj Close']
-            except:
-                continue
+                if len(batch) == 1:
+                    # Single ticker
+                    ticker = batch[0]
+                    data = yf.download(ticker, start=start_date, end=end_date,
+                                       progress=False, auto_adjust=True, threads=False)
+                    if not data.empty and 'Close' in data.columns:
+                        prices[ticker] = data['Close']
+                    elif not data.empty:
+                        prices[ticker] = data.iloc[:, 0]  # Take first column if no 'Close'
+                    else:
+                        failed.append(f"{ticker} (empty)")
+                else:
+                    # Multiple tickers - download as batch
+                    batch_str = ' '.join(batch)
+                    data = yf.download(batch_str, start=start_date, end=end_date,
+                                       progress=False, group_by='ticker', auto_adjust=True, threads=False)
+
+                    if not data.empty:
+                        # Check if multi-level columns (happens with multiple tickers)
+                        if isinstance(data.columns, pd.MultiIndex):
+                            # Multi-ticker format
+                            for ticker in batch:
+                                try:
+                                    if ticker in data.columns.levels[1]:
+                                        ticker_data = data[ticker]
+                                        if 'Close' in ticker_data.columns:
+                                            prices[ticker] = ticker_data['Close']
+                                        else:
+                                            prices[ticker] = ticker_data.iloc[:, 0]
+                                    else:
+                                        failed.append(f"{ticker} (not in batch)")
+                                except:
+                                    failed.append(f"{ticker} (parse error)")
+                        else:
+                            # Single ticker format (happens if only 1 ticker had data)
+                            if 'Close' in data.columns:
+                                # Assume it's for the first ticker that had data
+                                for ticker in batch:
+                                    test_data = yf.Ticker(ticker).history(period='1d')
+                                    if not test_data.empty:
+                                        prices[ticker] = data['Close']
+                                        break
+
+            except Exception as e:
+                print(f"  Batch failed ({str(e)[:50]}), trying individually...")
+                # If batch fails, try each ticker individually
+                for ticker in batch:
+                    try:
+                        ticker_obj = yf.Ticker(ticker)
+                        hist = ticker_obj.history(start=start_date, end=end_date, auto_adjust=True)
+
+                        if not hist.empty and len(hist) > 0:
+                            prices[ticker] = hist['Close']
+                        else:
+                            failed.append(f"{ticker} (no data)")
+
+                    except Exception as e2:
+                        failed.append(f"{ticker} ({str(e2)[:30]})")
+
+            # Progress update
+            successful_so_far = len(prices)
+            attempted_so_far = min(i + batch_size, len(tickers))
+            print(f"  Progress: {attempted_so_far}/{len(tickers)} attempted, {successful_so_far} successful")
+
+        print(f"\n{'=' * 60}")
+        print(f"FETCH RESULTS")
+        print(f"{'=' * 60}")
+        print(f"Requested: {len(tickers)} tickers")
+        print(f"Successful: {len(prices)} tickers")
+        print(f"Failed: {len(failed)} tickers")
+
+        if len(failed) > 0 and len(failed) <= 10:
+            print(f"\nFailed tickers:")
+            for f in failed[:10]:
+                print(f"  - {f}")
+        elif len(failed) > 10:
+            print(f"\nShowing first 10 failed tickers:")
+            for f in failed[:10]:
+                print(f"  - {f}")
+
+        print(f"{'=' * 60}\n")
+
+        if len(prices) == 0:
+            # Last resort: try SPY as a test
+            print("Testing yfinance connectivity with SPY...")
+            try:
+                test = yf.download('SPY', start=start_date, end=end_date, progress=False)
+                if not test.empty:
+                    print("✅ yfinance is working (SPY downloaded successfully)")
+                    print("❌ But none of your tickers worked. Check if they're valid symbols.")
+                else:
+                    print("❌ Even SPY failed - yfinance may be down or blocked")
+            except Exception as e:
+                print(f"❌ yfinance test failed: {e}")
+                print("\nPossible issues:")
+                print("1. Your network may be blocking yfinance")
+                print("2. Yahoo Finance may be temporarily down")
+                print("3. You may need to update yfinance: pip install --upgrade yfinance")
+
+            raise RuntimeError(f"Failed to fetch ANY price data! All {len(tickers)} tickers failed.")
+
+        if len(prices) < len(tickers) * 0.5:
+            print(f"⚠️  WARNING: Only got {len(prices)}/{len(tickers)} tickers ({len(prices) / len(tickers):.1%})")
+
         return pd.DataFrame(prices)
 
+    # KEEP ALL OTHER METHODS EXACTLY AS THEY WERE
     def fetch_ken_french_factors(self) -> pd.DataFrame:
-        """Fetch Fama-French 5 factors + momentum"""
+        """Fetch Fama-French 5 factors + momentum - THIS STAYS THE SAME"""
         try:
             base_url = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/"
 
@@ -169,7 +312,7 @@ class DataManager:
             }, index=dates)
 
     def fetch_macro_data(self) -> pd.DataFrame:
-        """Fetch macro data for regime detection using FRED API"""
+        """Fetch macro data for regime detection - THIS STAYS THE SAME"""
         try:
             from fredapi import Fred
             fred = Fred(api_key='9ce40465a0fe9920f496cd179b9b9a71')
@@ -235,7 +378,7 @@ class DataManager:
             return self._generate_synthetic_macro()
 
     def _generate_synthetic_macro(self) -> pd.DataFrame:
-        """Fallback: Generate synthetic macro data"""
+        """Fallback: Generate synthetic macro data - KEEP AS IS"""
         dates = pd.date_range(end=datetime.now(), periods=120, freq='M')
 
         macro = pd.DataFrame({
@@ -252,7 +395,6 @@ class DataManager:
         macro['inflation_delta'] = macro['inflation_yoy'].diff()
 
         return macro
-
 
 # ========================= REGIME MODULE =========================
 
@@ -311,12 +453,25 @@ class RegimeDetector:
         """Calculate probability-weighted expected factor premia"""
         expected_premia = {}
 
+        print(f"\n{'=' * 60}")
+        print(f"CALCULATING EXPECTED PREMIA")
+        print(f"{'=' * 60}")
+        print(f"Regime probabilities: {regime_probs}")
+
         for factor in ['HML', 'WML', 'RMW', 'CMA', 'SMB']:
-            weighted_premium = sum(
-                prob * self.historical_premia[regime]['mean'].get(factor, 0)
-                for regime, prob in regime_probs.items()
-            )
+            weighted_premium = 0.0
+            print(f"\n{factor}:")
+            for regime, prob in regime_probs.items():
+                regime_premium = self.historical_premia.get(regime, {}).get('mean', {}).get(factor, 0)
+                contribution = prob * regime_premium
+                weighted_premium += contribution
+                print(f"  Regime {regime} ({self.regime_names[regime]}): "
+                      f"prob={prob:.3f}, premium={regime_premium:.4f}, contrib={contribution:.4f}")
+
             expected_premia[factor] = weighted_premium
+            print(f"  → Total expected {factor}: {weighted_premium:.4f}")
+
+        print(f"{'=' * 60}\n")
 
         return expected_premia
 
@@ -422,18 +577,28 @@ class FactorCrashProtector:
         return drawdown.rolling(window).min()
 
     def predict_crash_probabilities(self, current_features: pd.DataFrame) -> Dict[str, float]:
-        """Predict crash probabilities for each factor"""
+        """Predict crash probabilities for each factor - NO DEFAULTS"""
         crash_probs = {}
 
+        print(f"\n{'=' * 60}")
+        print(f"PREDICTING CRASH PROBABILITIES")
+        print(f"{'=' * 60}")
+        print(f"Feature shape: {current_features.shape}")
+        print(f"Feature columns: {list(current_features.columns)}")
+
         for factor, model in self.models.items():
-            if model is not None:
-                try:
-                    prob = model.predict_proba(current_features.fillna(0))[0, 1]
-                    crash_probs[factor] = prob
-                except:
-                    crash_probs[factor] = 0.1  # Default low probability
-            else:
-                crash_probs[factor] = 0.1  # Default low probability
+            if model is None:
+                raise RuntimeError(f"Crash model for {factor} was not trained! Cannot predict.")
+
+            try:
+                prob = model.predict_proba(current_features.fillna(0))[0, 1]
+                crash_probs[factor] = prob
+                print(f"{factor}: {prob:.4f} (model trained)")
+            except Exception as e:
+                print(f"❌ ERROR predicting {factor} crash: {e}")
+                raise RuntimeError(f"Failed to predict {factor} crash probability: {e}")
+
+        print(f"{'=' * 60}\n")
 
         return crash_probs
 

@@ -88,33 +88,56 @@ def initialize_system():
         'portfolio_constructor': portfolio_constructor
     }
 
-
 @st.cache_data(ttl=3600)  # Cache for 1 hour
 def fetch_market_data(_data_manager):
-    """Fetch all necessary market data"""
+    """Fetch all necessary market data - SIMPLIFIED VERSION"""
     end_date = datetime.now()
     start_date = end_date - timedelta(days=365 * 5)
 
-    # Get universe
-    tickers = _data_manager.get_sp500_tickers()[:100]  # Smaller for demo
+    # Get stock universe from CSV file
+    with st.spinner("Loading stock universe from CSV..."):
+        tickers = _data_manager.get_filtered_universe()
 
-    # Fetch data
-    prices = _data_manager.fetch_prices(
-        tickers,
-        start_date.strftime('%Y-%m-%d'),
-        end_date.strftime('%Y-%m-%d')
-    )
+    st.success(f"📊 Loaded {len(tickers)} stocks from Stocks.csv")
 
-    factor_returns = _data_manager.fetch_ken_french_factors()
-    macro_data = _data_manager.fetch_macro_data()
+    # ALWAYS fetch sector ETFs (needed for market & sector analysis)
+    sector_etfs = list(_data_manager.sector_etfs.keys())
+
+    # Combine tickers: sector ETFs + individual stocks
+    all_tickers = sector_etfs + tickers
+
+    st.info(f"📊 Fetching data for {len(sector_etfs)} sector ETFs + {len(tickers)} stocks = {len(all_tickers)} total")
+
+    # Fetch all prices in one go (more efficient)
+    with st.spinner(f"Fetching price data for {len(all_tickers)} tickers... (this may take 2-3 minutes)"):
+        all_prices = _data_manager.fetch_prices(
+            all_tickers,
+            start_date.strftime('%Y-%m-%d'),
+            end_date.strftime('%Y-%m-%d')
+        )
+
+    st.success(f"✅ Successfully fetched {len(all_prices.columns)} tickers")
+
+    # Separate sector prices for reference
+    sector_prices = all_prices[[col for col in sector_etfs if col in all_prices.columns]]
+
+    # Fetch factor returns (Fama-French)
+    with st.spinner("Fetching Fama-French factor returns..."):
+        factor_returns = _data_manager.fetch_ken_french_factors()
+    st.success(f"✅ Fetched factor returns")
+
+    # Fetch macro data (FRED)
+    with st.spinner("Fetching macro data from FRED..."):
+        macro_data = _data_manager.fetch_macro_data()
+    st.success(f"✅ Fetched macro indicators")
 
     return {
-        'tickers': tickers,
-        'prices': prices,
-        'factor_returns': factor_returns,
-        'macro_data': macro_data
+        'tickers': tickers,  # Individual stock tickers from CSV
+        'prices': all_prices,  # All prices (sectors + stocks)
+        'sector_prices': sector_prices,  # Just sector ETF prices
+        'factor_returns': factor_returns,  # Fama-French factors
+        'macro_data': macro_data  # FRED macro indicators
     }
-
 
 def train_models(components, market_data):
     """Train regime and crash models"""
@@ -136,9 +159,15 @@ def calculate_current_signals(components, market_data):
     # Get latest macro data
     current_macro = market_data['macro_data'].iloc[-1]
 
+    # Debug: Print what we have
+    print(f"Debug: Current macro data:\n{current_macro}")
+
     # Regime probabilities
     regime_probs = components['regime_detector'].predict_regime_probabilities(current_macro)
     expected_premia = components['regime_detector'].get_expected_premia(regime_probs)
+
+    print(f"Debug: Regime probs: {regime_probs}")
+    print(f"Debug: Expected premia: {expected_premia}")
 
     # Crash probabilities
     crash_features = components['crash_protector']._prepare_crash_features(
@@ -148,6 +177,8 @@ def calculate_current_signals(components, market_data):
     ).iloc[-1:]
     crash_probs = components['crash_protector'].predict_crash_probabilities(crash_features)
 
+    print(f"Debug: Crash probs: {crash_probs}")
+
     # Market light
     market_light = components['selector'].calculate_market_light(crash_probs)
 
@@ -155,8 +186,11 @@ def calculate_current_signals(components, market_data):
     sector_scores = {}
     sector_exposures = {}
 
+    print(f"Debug: Analyzing {len(components['data_manager'].sector_etfs)} sectors...")
+
     for etf, sector_name in components['data_manager'].sector_etfs.items():
         if etf not in market_data['prices'].columns:
+            print(f"Debug: Skipping {sector_name} - no data for {etf}")
             continue
 
         sector_returns = market_data['prices'][etf].pct_change()
@@ -165,17 +199,39 @@ def calculate_current_signals(components, market_data):
             market_data['factor_returns']
         )
 
+        if len(exposures) == 0:
+            print(f"Debug: Skipping {sector_name} - no exposures calculated")
+            continue
+
         score = sum(
             exposures.get(factor, 0) * expected_premia.get(factor, 0) *
             (1.0 - crash_probs.get(factor, 0))
             for factor in expected_premia.keys()
         )
 
+        print(f"Debug: {sector_name} - Score: {score:.4f}, R2: {r2:.2f}")
+
         sector_scores[sector_name] = score
         sector_exposures[sector_name] = exposures
 
+    if len(sector_scores) == 0:
+        print("ERROR: No sector scores calculated!")
+        # Return defaults to prevent crash
+        return {
+            'market_light': market_light,
+            'crash_probs': crash_probs,
+            'regime_probs': regime_probs,
+            'expected_premia': expected_premia,
+            'sector_scores': pd.Series({'Technology': 0}),
+            'sector_lights': {'Technology': TrafficLight.YELLOW},
+            'sector_exposures': {'Technology': {f: 0 for f in ['HML', 'WML', 'RMW', 'CMA', 'SMB']}}
+        }
+
     sector_scores = pd.Series(sector_scores)
     sector_lights = components['selector'].calculate_sector_lights(sector_scores)
+
+    print(f"Debug: Calculated {len(sector_scores)} sector scores")
+    print(f"Debug: Sector lights: {sector_lights}")
 
     return {
         'market_light': market_light,
@@ -417,8 +473,15 @@ def main():
 
     # Train models
     if 'models_trained' not in st.session_state:
-        train_models(components, market_data)
-        st.session_state.models_trained = True
+        with st.spinner("Training models... (this may take a minute)"):
+            # Add debug info
+            st.write("Debug: Macro data shape:", market_data['macro_data'].shape)
+            st.write("Debug: Factor returns shape:", market_data['factor_returns'].shape)
+            st.write("Debug: Macro data sample:")
+            st.write(market_data['macro_data'].tail())
+
+            train_models(components, market_data)
+            st.session_state.models_trained = True
 
     # Calculate signals
     with st.spinner("Calculating signals..."):
