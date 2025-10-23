@@ -134,65 +134,75 @@ class DataManager:
             raise RuntimeError(f"Failed to read stock list from CSV: {e}")
 
     def fetch_prices(self, tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
-        """Fetch daily prices for multiple tickers - FIXED VERSION"""
+        """Fetch daily prices for multiple tickers - ACTUALLY WORKING VERSION"""
         print(f"\nFetching prices for {len(tickers)} tickers from {start_date} to {end_date}...")
 
         prices = {}
         failed = []
 
-        # Process in smaller batches and handle individually if batch fails
-        batch_size = 20  # Smaller batches are more reliable
+        # Process in batches
+        batch_size = 30
 
         for i in range(0, len(tickers), batch_size):
             batch = tickers[i:i + batch_size]
 
-            # Try batch download first
             try:
                 if len(batch) == 1:
                     # Single ticker
                     ticker = batch[0]
                     data = yf.download(ticker, start=start_date, end=end_date,
-                                       progress=False, auto_adjust=True, threads=False)
-                    if not data.empty and 'Close' in data.columns:
-                        prices[ticker] = data['Close']
-                    elif not data.empty:
-                        prices[ticker] = data.iloc[:, 0]  # Take first column if no 'Close'
+                                       progress=False, auto_adjust=True)
+                    if not data.empty:
+                        # For single ticker, columns are just field names
+                        if 'Close' in data.columns:
+                            prices[ticker] = data['Close']
+                        else:
+                            # Sometimes it's wrapped in a tuple
+                            for col in data.columns:
+                                if 'Close' in str(col):
+                                    prices[ticker] = data[col]
+                                    break
                     else:
                         failed.append(f"{ticker} (empty)")
                 else:
                     # Multiple tickers - download as batch
                     batch_str = ' '.join(batch)
                     data = yf.download(batch_str, start=start_date, end=end_date,
-                                       progress=False, group_by='ticker', auto_adjust=True, threads=False)
+                                       progress=False, group_by='ticker', auto_adjust=True)
 
                     if not data.empty:
                         # Check if multi-level columns (happens with multiple tickers)
                         if isinstance(data.columns, pd.MultiIndex):
-                            # Multi-ticker format
+                            # Multi-ticker format: (ticker, field)
+                            # Level 0 is tickers, Level 1 is fields
+                            available_tickers = data.columns.levels[0].tolist()
+
                             for ticker in batch:
-                                try:
-                                    if ticker in data.columns.levels[1]:
+                                if ticker in available_tickers:
+                                    try:
                                         ticker_data = data[ticker]
                                         if 'Close' in ticker_data.columns:
-                                            prices[ticker] = ticker_data['Close']
+                                            close_data = ticker_data['Close'].dropna()
+                                            if len(close_data) > 0:
+                                                prices[ticker] = close_data
+                                            else:
+                                                failed.append(f"{ticker} (all NaN)")
                                         else:
-                                            prices[ticker] = ticker_data.iloc[:, 0]
-                                    else:
-                                        failed.append(f"{ticker} (not in batch)")
-                                except:
-                                    failed.append(f"{ticker} (parse error)")
+                                            failed.append(f"{ticker} (no Close column)")
+                                    except Exception as e:
+                                        failed.append(f"{ticker} (extract error: {str(e)[:20]})")
+                                else:
+                                    failed.append(f"{ticker} (not in batch result)")
                         else:
-                            # Single ticker format (happens if only 1 ticker had data)
+                            # Single ticker returned (shouldn't happen with batch but handle it)
                             if 'Close' in data.columns:
-                                # Assume it's for the first ticker that had data
-                                for ticker in batch:
-                                    test_data = yf.Ticker(ticker).history(period='1d')
-                                    if not test_data.empty:
-                                        prices[ticker] = data['Close']
-                                        break
+                                # Assume it's for the first ticker
+                                prices[batch[0]] = data['Close']
+                                for ticker in batch[1:]:
+                                    failed.append(f"{ticker} (batch returned single)")
 
             except Exception as e:
-                print(f"  Batch failed ({str(e)[:50]}), trying individually...")
+                print(f"  Batch error: {str(e)[:50]}")
                 # If batch fails, try each ticker individually
                 for ticker in batch:
                     try:
@@ -202,10 +212,10 @@ class DataManager:
                         if not hist.empty and len(hist) > 0:
                             prices[ticker] = hist['Close']
                         else:
-                            failed.append(f"{ticker} (no data)")
+                            failed.append(f"{ticker} (individual: no data)")
 
                     except Exception as e2:
-                        failed.append(f"{ticker} ({str(e2)[:30]})")
+                        failed.append(f"{ticker} (individual: {str(e2)[:20]})")
 
             # Progress update
             successful_so_far = len(prices)
@@ -216,43 +226,32 @@ class DataManager:
         print(f"FETCH RESULTS")
         print(f"{'=' * 60}")
         print(f"Requested: {len(tickers)} tickers")
-        print(f"Successful: {len(prices)} tickers")
+        print(f"Successful: {len(prices)} tickers ({len(prices) / len(tickers) * 100:.1f}%)")
         print(f"Failed: {len(failed)} tickers")
 
-        if len(failed) > 0 and len(failed) <= 10:
+        if len(failed) > 0 and len(failed) <= 20:
             print(f"\nFailed tickers:")
-            for f in failed[:10]:
+            for f in failed[:20]:
                 print(f"  - {f}")
-        elif len(failed) > 10:
-            print(f"\nShowing first 10 failed tickers:")
-            for f in failed[:10]:
+        elif len(failed) > 20:
+            print(f"\nShowing first 20 failed tickers:")
+            for f in failed[:20]:
                 print(f"  - {f}")
+            print(f"  ... and {len(failed) - 20} more")
 
         print(f"{'=' * 60}\n")
 
         if len(prices) == 0:
-            # Last resort: try SPY as a test
-            print("Testing yfinance connectivity with SPY...")
-            try:
-                test = yf.download('SPY', start=start_date, end=end_date, progress=False)
-                if not test.empty:
-                    print("✅ yfinance is working (SPY downloaded successfully)")
-                    print("❌ But none of your tickers worked. Check if they're valid symbols.")
-                else:
-                    print("❌ Even SPY failed - yfinance may be down or blocked")
-            except Exception as e:
-                print(f"❌ yfinance test failed: {e}")
-                print("\nPossible issues:")
-                print("1. Your network may be blocking yfinance")
-                print("2. Yahoo Finance may be temporarily down")
-                print("3. You may need to update yfinance: pip install --upgrade yfinance")
+            raise RuntimeError(f"Failed to fetch ANY price data! Check network connection and ticker validity.")
 
-            raise RuntimeError(f"Failed to fetch ANY price data! All {len(tickers)} tickers failed.")
+        # Convert to DataFrame
+        df = pd.DataFrame(prices)
 
-        if len(prices) < len(tickers) * 0.5:
-            print(f"⚠️  WARNING: Only got {len(prices)}/{len(tickers)} tickers ({len(prices) / len(tickers):.1%})")
+        # Report on data quality
+        print(f"Final DataFrame shape: {df.shape}")
+        print(f"Date range: {df.index[0]} to {df.index[-1]}")
 
-        return pd.DataFrame(prices)
+        return df
 
     # KEEP ALL OTHER METHODS EXACTLY AS THEY WERE
     def fetch_ken_french_factors(self) -> pd.DataFrame:
