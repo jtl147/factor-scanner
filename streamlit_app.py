@@ -139,6 +139,7 @@ def fetch_market_data(_data_manager):
         'macro_data': macro_data  # FRED macro indicators
     }
 
+
 def train_models(components, market_data):
     """Train regime and crash models"""
     with st.spinner("Training regime detector..."):
@@ -155,27 +156,58 @@ def train_models(components, market_data):
 
 
 def calculate_current_signals(components, market_data):
-    """Calculate all current signals"""
+    """Calculate all current signals - FIXED VERSION"""
     # Get latest macro data
     current_macro = market_data['macro_data'].iloc[-1]
 
     # Debug: Print what we have
     print(f"Debug: Current macro data:\n{current_macro}")
 
-    # Regime probabilities
-    regime_probs = components['regime_detector'].predict_regime_probabilities(current_macro)
-    expected_premia = components['regime_detector'].get_expected_premia(regime_probs)
+    # Regime probabilities - need to handle potential NaN/inf in features
+    try:
+        # Clean the macro data before prediction
+        current_macro_clean = current_macro.fillna(0).replace([np.inf, -np.inf], 0)
+        regime_probs = components['regime_detector'].predict_regime_probabilities(current_macro_clean)
+
+        # Check if we got NaN results
+        if any(np.isnan(list(regime_probs.values()))):
+            print("Warning: Got NaN regime probabilities, using equal weights")
+            regime_probs = {i: 0.2 for i in range(5)}  # Equal weights for 5 regimes
+
+        expected_premia = components['regime_detector'].get_expected_premia(regime_probs)
+    except Exception as e:
+        print(f"Warning: Regime prediction failed: {e}")
+        regime_probs = {i: 0.2 for i in range(5)}
+        expected_premia = {'HML': 0.0, 'WML': 0.01, 'RMW': 0.005, 'CMA': 0.0, 'SMB': -0.005}
 
     print(f"Debug: Regime probs: {regime_probs}")
     print(f"Debug: Expected premia: {expected_premia}")
 
-    # Crash probabilities
-    crash_features = components['crash_protector']._prepare_crash_features(
-        market_data['factor_returns'],
-        market_data['macro_data'],
-        'WML'
-    ).iloc[-1:]
-    crash_probs = components['crash_protector'].predict_crash_probabilities(crash_features)
+    # Crash probabilities - FIX: Need to prepare features for EACH factor separately
+    crash_probs = {}
+    factors = ['HML', 'WML', 'RMW', 'CMA', 'SMB']
+
+    for factor in factors:
+        try:
+            # Prepare features specific to this factor
+            factor_features = components['crash_protector']._prepare_crash_features(
+                market_data['factor_returns'],
+                market_data['macro_data'],
+                factor  # Use the current factor, not hardcoded 'WML'
+            ).iloc[-1:]
+
+            # Get the model for this factor
+            model = components['crash_protector'].models.get(factor)
+            if model is not None:
+                prob = model.predict_proba(factor_features.fillna(0))[0, 1]
+                crash_probs[factor] = float(prob)
+            else:
+                # Fallback if model wasn't trained
+                crash_probs[factor] = 0.10  # Default low risk
+                print(f"Warning: No model for {factor}, using default")
+        except Exception as e:
+            print(f"Warning: Could not predict {factor} crash: {e}")
+            crash_probs[factor] = 0.10  # Default low risk
 
     print(f"Debug: Crash probs: {crash_probs}")
 
@@ -474,12 +506,6 @@ def main():
     # Train models
     if 'models_trained' not in st.session_state:
         with st.spinner("Training models... (this may take a minute)"):
-            # Add debug info
-            st.write("Debug: Macro data shape:", market_data['macro_data'].shape)
-            st.write("Debug: Factor returns shape:", market_data['factor_returns'].shape)
-            st.write("Debug: Macro data sample:")
-            st.write(market_data['macro_data'].tail())
-
             train_models(components, market_data)
             st.session_state.models_trained = True
 
@@ -507,7 +533,7 @@ def main():
                 'GREEN': "green",
                 'YELLOW': "yellow",
                 'RED': "red"
-            }[signals['market_light'].value]  # Use .value to get the string
+            }[signals['market_light'].value]
 
             st.markdown(f"""
                 <div class="traffic-light-{light_color}">
